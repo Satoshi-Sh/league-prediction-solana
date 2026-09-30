@@ -1,0 +1,20 @@
+[package]
+name = "seeder"
+version = "0.1.0"
+edition = "2021"
+description = "Loads the 2026 demo season (predictions and daily standings) into a local validator"
+
+# Standalone crate: keeps it out of the Anchor workspace so `anchor build` ignores it.
+[workspace]
+
+[dependencies]
+anchor-lang = "1.2.0"
+prediction_league = { path = "../../programs/prediction_league", features = ["no-entrypoint"] }
+csv = "1"
+sha2 = "0.10"
+solana-rpc-client = "3.1"
+solana-keypair = "3"
+solana-signer = "3"
+solana-transaction = { version = "3", features = ["bincode"] }
+solana-commitment-config = "3.1.1"
+solana-account = "3"

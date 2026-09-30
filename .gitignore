@@ -9,3 +9,6 @@ test-ledger
 
 # Downloaded NPB pages (tools/npb_standings)
 data/cache/
+
+# Local demo admin key (tools/seeder)
+data/demo-admin.json
