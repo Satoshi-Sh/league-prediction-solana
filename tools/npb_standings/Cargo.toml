@@ -1,0 +1,13 @@
+[package]
+name = "npb_standings"
+version = "0.1.0"
+edition = "2021"
+description = "Builds daily Central League standings from NPB's official game results"
+
+# Standalone crate: the empty [workspace] table keeps it out of the Anchor workspace,
+# so `anchor build` does not try to compile it for the Solana target.
+[workspace]
+
+[dependencies]
+regex = "1"
+ureq = "3"

@@ -6,3 +6,6 @@ node_modules
 test-ledger
 .yarn
 .surfpool
+
+# Downloaded NPB pages (tools/npb_standings)
+data/cache/
