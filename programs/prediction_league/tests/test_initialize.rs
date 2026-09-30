@@ -286,3 +286,168 @@ fn test_username_max_length_and_duplicates_allowed() {
         assert_eq!(stored.username, exactly_16);
     }
 }
+
+
+fn finalize_season_ix(program_id: Pubkey, season: Pubkey, admin: &Keypair) -> Instruction {
+    Instruction::new_with_bytes(
+        program_id,
+        &prediction_league::instruction::FinalizeSeason {}.data(),
+        prediction_league::accounts::FinalizeSeason {
+            admin: admin.pubkey(),
+            season,
+        }
+        .to_account_metas(None),
+    )
+}
+
+fn score_prediction_ix(
+    program_id: Pubkey,
+    season: Pubkey,
+    caller: &Keypair,
+    prediction: Pubkey,
+) -> Instruction {
+    Instruction::new_with_bytes(
+        program_id,
+        &prediction_league::instruction::ScorePrediction {}.data(),
+        prediction_league::accounts::ScorePrediction {
+            caller: caller.pubkey(),
+            season,
+            prediction,
+        }
+        .to_account_metas(None),
+    )
+}
+
+fn read_prediction(svm: &LiteSVM, addr: &Pubkey) -> prediction_league::Prediction {
+    let account = svm.get_account(addr).unwrap();
+    let mut data: &[u8] = &account.data;
+    prediction_league::Prediction::try_deserialize(&mut data).unwrap()
+}
+
+/// Funds a new user and submits a prediction for them.
+fn new_predictor(
+    svm: &mut LiteSVM,
+    program_id: Pubkey,
+    season: Pubkey,
+    name: &str,
+    order: [u8; 6],
+) -> (Keypair, Pubkey) {
+    let user = Keypair::new();
+    svm.airdrop(&user.pubkey(), 1_000_000_000).unwrap();
+    let (ix, prediction) = submit_prediction_ix(program_id, season, &user, name, order);
+    send(svm, ix, &user).unwrap();
+    (user, prediction)
+}
+
+#[test]
+fn test_finalize_and_score_predictions() {
+    let (mut svm, program_id, admin, season) = setup();
+
+    let perfect_order = [1, 0, 2, 3, 4, 5];
+    let swapped_order = [0, 1, 2, 3, 4, 5];
+    let (_, perfect) = new_predictor(&mut svm, program_id, season, "perfect", perfect_order);
+    let (_, swapped) = new_predictor(&mut svm, program_id, season, "swapped", swapped_order);
+
+    // Day 1 differs from the final day, so only the last standings count for the final score.
+    let day1 = [0, 1, 2, 3, 4, 5];
+    let (ix, _) = post_daily_ix(program_id, season, &admin, 1, 20260328, day1);
+    send(&mut svm, ix, &admin).unwrap();
+    let (ix, _) = post_daily_ix(program_id, season, &admin, 2, 20260329, perfect_order);
+    send(&mut svm, ix, &admin).unwrap();
+
+    send(&mut svm, finalize_season_ix(program_id, season, &admin), &admin).unwrap();
+
+    // Anyone can trigger scoring, not just the admin.
+    let caller = Keypair::new();
+    svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
+    send(&mut svm, score_prediction_ix(program_id, season, &caller, perfect), &caller).unwrap();
+    send(&mut svm, score_prediction_ix(program_id, season, &caller, swapped), &caller).unwrap();
+
+    let p = read_prediction(&svm, &perfect);
+    assert!(p.scored);
+    assert_eq!(p.score, 100);
+
+    // [0,1,..] vs final [1,0,..]: two teams one place off, distance 2 -> 100 * 16 / 18 = 89
+    let s = read_prediction(&svm, &swapped);
+    assert!(s.scored);
+    assert_eq!(s.score, 89);
+}
+
+#[test]
+fn test_score_before_finalize_rejected() {
+    let (mut svm, program_id, admin, season) = setup();
+    let (user, prediction) =
+        new_predictor(&mut svm, program_id, season, "early", [0, 1, 2, 3, 4, 5]);
+
+    let (ix, _) = post_daily_ix(program_id, season, &admin, 1, 20260328, [0, 1, 2, 3, 4, 5]);
+    send(&mut svm, ix, &admin).unwrap();
+
+    let err = send(
+        &mut svm,
+        score_prediction_ix(program_id, season, &user, prediction),
+        &user,
+    )
+    .unwrap_err();
+
+    // 6007 = LeagueError::SeasonNotFinalized
+    assert!(err.contains("Custom(6007)"), "unexpected error: {}", err);
+}
+
+#[test]
+fn test_score_twice_rejected() {
+    let (mut svm, program_id, admin, season) = setup();
+    let (user, prediction) =
+        new_predictor(&mut svm, program_id, season, "twice", [0, 1, 2, 3, 4, 5]);
+
+    let (ix, _) = post_daily_ix(program_id, season, &admin, 1, 20260328, [0, 1, 2, 3, 4, 5]);
+    send(&mut svm, ix, &admin).unwrap();
+    send(&mut svm, finalize_season_ix(program_id, season, &admin), &admin).unwrap();
+
+    send(&mut svm, score_prediction_ix(program_id, season, &user, prediction), &user).unwrap();
+
+    // A fresh blockhash so the second transaction isn't treated as a duplicate of the first.
+    svm.expire_blockhash();
+    let err = send(
+        &mut svm,
+        score_prediction_ix(program_id, season, &user, prediction),
+        &user,
+    )
+    .unwrap_err();
+
+    // 6008 = LeagueError::AlreadyScored
+    assert!(err.contains("Custom(6008)"), "unexpected error: {}", err);
+}
+
+#[test]
+fn test_finalize_rules() {
+    let (mut svm, program_id, admin, season) = setup();
+
+    // Non-admin cannot finalize (6002 = Unauthorized).
+    let intruder = Keypair::new();
+    svm.airdrop(&intruder.pubkey(), 1_000_000_000).unwrap();
+    let err = send(&mut svm, finalize_season_ix(program_id, season, &intruder), &intruder)
+        .unwrap_err();
+    assert!(err.contains("Custom(6002)"), "unexpected error: {}", err);
+
+    // Cannot finalize before any day is posted (6006 = NoResultsPosted).
+    let err = send(&mut svm, finalize_season_ix(program_id, season, &admin), &admin).unwrap_err();
+    assert!(err.contains("Custom(6006)"), "unexpected error: {}", err);
+
+    let (ix, _) = post_daily_ix(program_id, season, &admin, 1, 20260328, [0, 1, 2, 3, 4, 5]);
+    send(&mut svm, ix, &admin).unwrap();
+
+    // Same instruction as the failed attempt above, so use a fresh blockhash to avoid
+    // AlreadyProcessed (the VM also remembers failed transactions).
+    svm.expire_blockhash();
+    send(&mut svm, finalize_season_ix(program_id, season, &admin), &admin).unwrap();
+
+    // Finalizing twice fails (6005 = SeasonFinalized).
+    svm.expire_blockhash();
+    let err = send(&mut svm, finalize_season_ix(program_id, season, &admin), &admin).unwrap_err();
+    assert!(err.contains("Custom(6005)"), "unexpected error: {}", err);
+
+    // No more days after finalizing (6005 = SeasonFinalized).
+    let (ix, _) = post_daily_ix(program_id, season, &admin, 2, 20260329, [0, 1, 2, 3, 4, 5]);
+    let err = send(&mut svm, ix, &admin).unwrap_err();
+    assert!(err.contains("Custom(6005)"), "unexpected error: {}", err);
+}

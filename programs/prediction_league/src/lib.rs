@@ -1,6 +1,9 @@
 
 use anchor_lang::prelude::*;
 
+pub mod scoring;
+use scoring::score_for;
+
 declare_id!("9kLrKPQLcRbeiEAPR9ttovQ2yXQ6rUYZdD63JQzqvLTP");
 
 /// Max username length in bytes (must match `#[max_len]` on `Prediction::username`).
@@ -32,6 +35,7 @@ pub mod prediction_league {
     ) -> Result<()> {
         let season = &mut ctx.accounts.season;
 
+        require!(!season.results_posted, LeagueError::SeasonFinalized);
         require!(
             day_index == season.last_day + 1,
             LeagueError::DayOutOfOrder
@@ -74,6 +78,29 @@ pub mod prediction_league {
         Ok(())
     }
 
+    /// Admin marks the season as over. The standings in `Season.results` (the last posted day)
+    /// become the final result, and no more days can be posted.
+    pub fn finalize_season(ctx: Context<FinalizeSeason>) -> Result<()> {
+        let season = &mut ctx.accounts.season;
+        require!(!season.results_posted, LeagueError::SeasonFinalized);
+        require!(season.last_day > 0, LeagueError::NoResultsPosted);
+
+        season.results_posted = true;
+        Ok(())
+    }
+
+    /// Writes the final score of one prediction. Anyone can call this once the season is final.
+    pub fn score_prediction(ctx: Context<ScorePrediction>) -> Result<()> {
+        let season = &ctx.accounts.season;
+        require!(season.results_posted, LeagueError::SeasonNotFinalized);
+
+        let prediction = &mut ctx.accounts.prediction;
+        require!(!prediction.scored, LeagueError::AlreadyScored);
+
+        prediction.score = score_for(&prediction.order, &season.results);
+        prediction.scored = true;
+        Ok(())
+    }
 }
 
 
@@ -152,6 +179,24 @@ pub struct PostDailyResult<'info> {
     pub system_program: Program<'info, System>,
 }
 
+#[derive(Accounts)]
+pub struct FinalizeSeason<'info> {
+    pub admin: Signer<'info>,
+
+    #[account(mut, has_one = admin @ LeagueError::Unauthorized)]
+    pub season: Account<'info, Season>,
+}
+
+#[derive(Accounts)]
+pub struct ScorePrediction<'info> {
+    pub caller: Signer<'info>,
+
+    pub season: Account<'info, Season>,
+
+    #[account(mut, has_one = season)]
+    pub prediction: Account<'info, Prediction>,
+}
+
 #[account]
 #[derive(InitSpace)]
 pub struct Season {
@@ -203,4 +248,12 @@ pub enum LeagueError {
     DayOutOfOrder,
     #[msg("Username must be 1 to 16 bytes and not blank")]
     InvalidUsername,
+    #[msg("The season is already finalized")]
+    SeasonFinalized,
+    #[msg("Post at least one daily result before finalizing")]
+    NoResultsPosted,
+    #[msg("The season has not been finalized yet")]
+    SeasonNotFinalized,
+    #[msg("This prediction has already been scored")]
+    AlreadyScored,
 }
