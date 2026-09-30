@@ -1,10 +1,2 @@
-use anchor_lang::prelude::*;
-
-#[constant]
-pub const COUNTER_SEED: &[u8] = b"counter";
-
-#[constant]
-pub const HELLO_WORLD_LAMPORTS: u64 = 1;
-
-#[constant]
-pub const MAX_COUNT: u64 = 10;
+/// Max username length in bytes (must match `#[max_len]` on `Prediction::username`).
+pub const MAX_USERNAME_LEN: usize = 16;
