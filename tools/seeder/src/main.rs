@@ -18,13 +18,17 @@ use std::{
 use anchor_lang::{
     prelude::Pubkey,
     solana_program::{instruction::Instruction, system_instruction, system_program},
-    AccountDeserialize, InstructionData, ToAccountMetas,
+    AccountDeserialize, Discriminator, InstructionData, ToAccountMetas,
 };
 use data::{DayRow, PredictionRow};
 use prediction_league::{scoring::score_for, DailyResult, Prediction, Season};
 use solana_commitment_config::CommitmentConfig;
 use solana_keypair::{read_keypair_file, write_keypair_file, Keypair};
 use solana_rpc_client::rpc_client::RpcClient;
+use solana_rpc_client_api::{
+    config::RpcProgramAccountsConfig,
+    filter::{Memcmp, RpcFilterType},
+};
 use solana_signer::Signer;
 use solana_transaction::Transaction;
 
@@ -49,7 +53,9 @@ Options:
   --standings <file>       default data/2026_cl_standings.csv
   --predictions <file>     default data/2026_cl_predictions.csv
   --season-id <n>          default 2026
-  --deadline-minutes <n>   prediction window when creating the season, default 30
+  --deadline-minutes <n>   prediction window when creating the season, default 30. Only used when the
+                           season is created. For a demo where people submit predictions on the
+                           dashboard, use something long, e.g. 525600 (one year)
   --finalize               end the season and write every final score (irreversible)
 ";
 
@@ -140,6 +146,34 @@ fn fetch_accounts(
     for chunk in keys.chunks(100) {
         out.extend(client.get_multiple_accounts(chunk).map_err(|e| e.to_string())?);
     }
+    Ok(out)
+}
+
+/// Every prediction of the season that is on-chain, including ones people submitted through the
+/// dashboard (they are not in the CSV). Layout: 8-byte tag, `user` (32), then `season` at byte 40.
+fn season_predictions(
+    client: &RpcClient,
+    program_id: &Pubkey,
+    season_key: &Pubkey,
+) -> Result<Vec<(Pubkey, Prediction)>, String> {
+    let config = RpcProgramAccountsConfig {
+        filters: Some(vec![
+            RpcFilterType::Memcmp(Memcmp::new_raw_bytes(0, Prediction::DISCRIMINATOR.to_vec())),
+            RpcFilterType::Memcmp(Memcmp::new_raw_bytes(40, season_key.to_bytes().to_vec())),
+        ]),
+        ..Default::default()
+    };
+    let accounts = client
+        .get_program_ui_accounts_with_config(program_id, config)
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::with_capacity(accounts.len());
+    for (key, account) in accounts {
+        let data = account.data.decode().ok_or("could not decode a prediction account")?;
+        let prediction =
+            Prediction::try_deserialize(&mut data.as_slice()).map_err(|e| e.to_string())?;
+        out.push((key, prediction));
+    }
+    out.sort_by(|a, b| a.1.username.cmp(&b.1.username).then(a.0.cmp(&b.0)));
     Ok(out)
 }
 
@@ -277,11 +311,11 @@ fn run() -> Result<(), String> {
     // 4. Finalize (only when asked)
     let mut season = read_season(&client, &season_key)?.ok_or("season disappeared")?;
     if args.finalize {
-        finalize(&client, &admin, program_id, season_key, &season, &predictors)?;
+        finalize(&client, &admin, program_id, season_key, &season)?;
         season = read_season(&client, &season_key)?.ok_or("season disappeared")?;
     }
 
-    summary(&client, &season, &predictors)
+    summary(&client, &program_id, &season_key, &season)
 }
 
 fn seed_predictions(
@@ -435,7 +469,6 @@ fn finalize(
     program_id: Pubkey,
     season_key: Pubkey,
     season: &Season,
-    predictors: &[Predictor],
 ) -> Result<(), String> {
     if !season.results_posted {
         let ix = Instruction::new_with_bytes(
@@ -448,12 +481,9 @@ fn finalize(
         println!("Season finalized with day {} as the final standings", season.last_day);
     }
 
-    let keys: Vec<Pubkey> = predictors.iter().map(|p| p.account).collect();
+    // Score everything on-chain for this season, not only the CSV pundits.
     let mut scored = 0;
-    for (p, account) in predictors.iter().zip(fetch_accounts(client, &keys)?) {
-        let account = account.ok_or(format!("prediction for {} is missing", p.row.username))?;
-        let prediction =
-            Prediction::try_deserialize(&mut account.data.as_slice()).map_err(|e| e.to_string())?;
+    for (key, prediction) in season_predictions(client, &program_id, &season_key)? {
         if prediction.scored {
             continue;
         }
@@ -463,11 +493,11 @@ fn finalize(
             prediction_league::accounts::ScorePrediction {
                 caller: admin.pubkey(),
                 season: season_key,
-                prediction: p.account,
+                prediction: key,
             }
             .to_account_metas(None),
         );
-        send(client, admin, &[ix]).map_err(|e| format!("scoring {}: {e}", p.row.username))?;
+        send(client, admin, &[ix]).map_err(|e| format!("scoring {}: {e}", prediction.username))?;
         scored += 1;
     }
     println!("Wrote the final score for {scored} predictions");
@@ -475,12 +505,14 @@ fn finalize(
 }
 
 /// Reads everything back from the chain and prints what a dashboard would show.
-fn summary(client: &RpcClient, season: &Season, predictors: &[Predictor]) -> Result<(), String> {
-    let keys: Vec<Pubkey> = predictors.iter().map(|p| p.account).collect();
+fn summary(
+    client: &RpcClient,
+    program_id: &Pubkey,
+    season_key: &Pubkey,
+    season: &Season,
+) -> Result<(), String> {
     let mut scores: Vec<(String, u8, bool)> = Vec::new();
-    for account in fetch_accounts(client, &keys)? {
-        let account = account.ok_or("a prediction is missing")?;
-        let p = Prediction::try_deserialize(&mut account.data.as_slice()).map_err(|e| e.to_string())?;
+    for (_, p) in season_predictions(client, program_id, season_key)? {
         // On-chain `score` only exists after finalizing; otherwise show the score right now.
         let score = if p.scored { p.score } else { score_for(&p.order, &season.results) };
         scores.push((p.username, score, p.scored));

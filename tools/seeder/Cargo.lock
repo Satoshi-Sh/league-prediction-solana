@@ -2125,6 +2125,7 @@ dependencies = [
  "solana-commitment-config",
  "solana-keypair",
  "solana-rpc-client",
+ "solana-rpc-client-api",
  "solana-signer",
  "solana-transaction",
 ]
