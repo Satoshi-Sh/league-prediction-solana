@@ -7,10 +7,17 @@
 //!   On the first day that starting order is the fixed team index order below.
 //!
 //! Interleague games count towards a team's record, as in NPB's official table.
+//!
+//! Only the regular season counts: a Central League team plays `REGULAR_SEASON_GAMES` games.
+//! Anything after a team's last regular-season game is postseason (Climax Series, Japan Series)
+//! and is ignored, even though the calendar pages list it like any other game.
 
 use std::collections::{BTreeMap, HashSet};
 
 use crate::parse::Game;
+
+/// Regular-season games per Central League team (interleague included).
+pub const REGULAR_SEASON_GAMES: u32 = 143;
 
 /// Central League teams in the order used by the Solana program (team index = position).
 /// `code` is the abbreviation NPB uses on its calendar pages.
@@ -101,6 +108,10 @@ pub fn compute_days(games: &[Game], as_of: Option<u32>) -> Vec<Day> {
             let b = team_index(&game.team_b);
             if a.is_none() && b.is_none() {
                 continue; // Pacific League game
+            }
+            // A team that has finished its 143 games is in the postseason: not part of the table.
+            if [a, b].into_iter().flatten().any(|i| records[i].games() >= REGULAR_SEASON_GAMES) {
+                continue;
             }
             played_cl_game = true;
 
@@ -223,6 +234,36 @@ mod tests {
         ];
         assert_eq!(compute_days(&games, Some(20260327)).len(), 1);
         assert_eq!(compute_days(&games, None).len(), 2);
+    }
+
+    #[test]
+    fn games_after_a_teams_143rd_are_postseason_and_ignored() {
+        // G and T play 143 games (G wins them all), then a "Climax Series" game that T wins.
+        let mut games: Vec<Game> = (0..REGULAR_SEASON_GAMES)
+            .map(|i| game(&format!("r{i}"), 20260001 + i, "G", 2, "T", 1))
+            .collect();
+        games.push(game("cs1", 20260500, "T", 5, "G", 0));
+
+        let days = compute_days(&games, None);
+        assert_eq!(days.len() as u32, REGULAR_SEASON_GAMES, "the postseason day gets no row");
+        let last = days.last().unwrap();
+        assert_eq!(last.records[0], Record { wins: 143, losses: 0, ties: 0 });
+        assert_eq!(last.records[1], Record { wins: 0, losses: 143, ties: 0 });
+        assert!(last.date < 20260500);
+    }
+
+    #[test]
+    fn a_team_still_in_the_regular_season_keeps_counting() {
+        // G has finished (143 games). D and S have not, and their game must still count.
+        let mut games: Vec<Game> = (0..REGULAR_SEASON_GAMES)
+            .map(|i| game(&format!("r{i}"), 20260001 + i, "G", 2, "T", 1))
+            .collect();
+        games.push(game("x", 20260500, "D", 3, "S", 1));
+
+        let days = compute_days(&games, None);
+        let last = days.last().unwrap();
+        assert_eq!(last.date, 20260500);
+        assert_eq!(last.records[4], Record { wins: 1, losses: 0, ties: 0 });
     }
 
     #[test]
