@@ -35,6 +35,12 @@ use solana_transaction::Transaction;
 const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
 /// Every pundit wallet gets this much to pay for its prediction account.
 const PREDICTOR_FUNDING: u64 = LAMPORTS_PER_SOL / 100;
+/// Per game day: rent for the DailyResult account (about 0.0013 SOL) plus the fee.
+const DAY_COST: u64 = 2_000_000;
+/// Fees for funding and scoring one pundit wallet, on top of `PREDICTOR_FUNDING`.
+const PREDICTOR_FEES: u64 = 100_000;
+/// Season account rent, a few fees and a safety margin.
+const BASE_COST: u64 = 10_000_000;
 const TEAM_NAMES: [&str; 6] = ["Yomiuri", "Hanshin", "DeNA", "Hiroshima", "Chunichi", "Yakult"];
 const HELP: &str = "\
 Loads the 2026 demo season into a validator. Safe to re-run.
@@ -49,7 +55,8 @@ deployed\"), so build an SBPF v1 copy for it:
 Options:
   --rpc <url>              default http://127.0.0.1:8899 (other hosts need --allow-remote)
   --allow-remote           allow a non-local RPC. This writes real people's names on-chain.
-  --admin-keypair <file>   default data/demo-admin.json (created if missing; test key only)
+  --admin-keypair <file>   default data/demo-admin.json (created if missing; test key only). On devnet
+                           pass a wallet that already has SOL, e.g. ~/.config/solana/id.json
   --standings <file>       default data/2026_cl_standings.csv
   --predictions <file>     default data/2026_cl_predictions.csv
   --season-id <n>          default 2026
@@ -177,9 +184,33 @@ fn season_predictions(
     Ok(out)
 }
 
-fn ensure_funded(client: &RpcClient, key: &Pubkey, minimum: u64) -> Result<(), String> {
-    if client.get_balance(key).map_err(|e| e.to_string())? >= minimum {
+/// What the admin wallet needs for a complete run of this many pundits and game days.
+/// Deliberately a bit high: a re-run that only adds a few days needs far less.
+fn admin_budget(predictors: usize, days: usize) -> u64 {
+    BASE_COST + days as u64 * DAY_COST + predictors as u64 * (PREDICTOR_FUNDING + PREDICTOR_FEES)
+}
+
+fn sol(lamports: u64) -> String {
+    format!("{:.3} SOL", lamports as f64 / LAMPORTS_PER_SOL as f64)
+}
+
+/// Makes sure the admin can pay for the run. A local validator has a faucet, so top up from it.
+/// On a public cluster the faucet is rate limited, so ask the person to send SOL instead.
+fn ensure_funded(client: &RpcClient, key: &Pubkey, minimum: u64, faucet: bool) -> Result<(), String> {
+    let balance = client.get_balance(key).map_err(|e| e.to_string())?;
+    if balance >= minimum {
         return Ok(());
+    }
+    if !faucet {
+        return Err(format!(
+            "the admin wallet {key} has {} but this run needs about {}.\n\
+             Send it some SOL, for example: solana transfer {key} {:.1} --url {}\n\
+             (or pass --admin-keypair with a wallet that already has enough)",
+            sol(balance),
+            sol(minimum),
+            (minimum - balance) as f64 / LAMPORTS_PER_SOL as f64 + 0.05,
+            client.url(),
+        ));
     }
     println!("Airdropping {} SOL to the admin", 2 * minimum / LAMPORTS_PER_SOL);
     client.request_airdrop(key, 2 * minimum).map_err(|e| format!("airdrop failed: {e}"))?;
@@ -247,7 +278,8 @@ fn run() -> Result<(), String> {
     }
 
     let admin = load_or_create_admin(&args.admin)?;
-    ensure_funded(&client, &admin.pubkey(), 5 * LAMPORTS_PER_SOL)?;
+    let budget = admin_budget(rows.len(), days.len());
+    ensure_funded(&client, &admin.pubkey(), budget, data::is_local_url(&args.rpc))?;
 
     let (season_key, _) =
         Pubkey::find_program_address(&[b"season", &args.season_id.to_le_bytes()], &program_id);
@@ -545,5 +577,34 @@ fn main() {
     if let Err(e) = run() {
         eprintln!("error: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn budget_grows_with_the_run_and_always_covers_pundit_funding() {
+        assert_eq!(admin_budget(0, 0), BASE_COST);
+        assert!(admin_budget(124, 158) >= 124 * PREDICTOR_FUNDING + 158 * DAY_COST);
+        assert!(admin_budget(10, 158) < admin_budget(124, 158));
+    }
+
+    #[test]
+    fn a_small_devnet_run_needs_well_under_one_sol() {
+        // 10 pundits and the whole 158-day season.
+        assert!(admin_budget(10, 158) < LAMPORTS_PER_SOL / 2);
+    }
+
+    #[test]
+    fn the_full_local_run_needs_less_than_the_old_fixed_five_sol() {
+        assert!(admin_budget(124, 158) < 2 * LAMPORTS_PER_SOL);
+    }
+
+    #[test]
+    fn sol_is_printed_with_three_decimals() {
+        assert_eq!(sol(1_500_000_000), "1.500 SOL");
+        assert_eq!(sol(427_000_000), "0.427 SOL");
     }
 }
